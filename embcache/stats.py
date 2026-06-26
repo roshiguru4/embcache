@@ -11,6 +11,7 @@ that is roughly what the hit would have cost had it gone to the API.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -62,3 +63,34 @@ class Stats:
         self.dollars_saved = 0.0
         self.latency_saved_ms = 0.0
         self._miss_latency_total_ms = 0.0
+
+    def snapshot(self) -> dict[str, float]:
+        """Return the five reportable counters as a plain ``{name: value}`` dict.
+
+        Used to persist cumulative savings and to compute the delta to flush.
+        The internal miss-latency running total is intentionally excluded — it
+        is a per-session estimation aid, not a savings figure.
+        """
+        return {
+            "hits": float(self.hits),
+            "misses": float(self.misses),
+            "tokens_saved": float(self.tokens_saved),
+            "dollars_saved": self.dollars_saved,
+            "latency_saved_ms": self.latency_saved_ms,
+        }
+
+    @classmethod
+    def from_counters(cls, counters: Mapping[str, float]) -> "Stats":
+        """Rebuild a :class:`Stats` from persisted counters (e.g. lifetime).
+
+        Counts are coerced back to ``int``; dollars and latency stay ``float``.
+        The result is a read-only-style view for reporting: only the reportable
+        fields are populated.
+        """
+        return cls(
+            hits=int(counters.get("hits", 0)),
+            misses=int(counters.get("misses", 0)),
+            tokens_saved=int(counters.get("tokens_saved", 0)),
+            dollars_saved=float(counters.get("dollars_saved", 0.0)),
+            latency_saved_ms=float(counters.get("latency_saved_ms", 0.0)),
+        )

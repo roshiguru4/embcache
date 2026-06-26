@@ -17,17 +17,23 @@ def _format_latency(ms: float) -> str:
     return f"~{ms:.0f}ms"
 
 
-def format_report(stats: Stats, *, model: str | None = None) -> str:
+def format_report(
+    stats: Stats, *, model: str | None = None, scope: str | None = None
+) -> str:
     """Render ``stats`` as a multi-line plain-text report.
 
     Args:
-        stats: The accumulated session stats.
+        stats: The accumulated stats (session or lifetime).
         model: Optional model name to include in the header.
+        scope: Optional scope label (e.g. ``"session"`` or ``"lifetime"``)
+            shown in the header to disambiguate which window the numbers cover.
 
     Returns:
         A formatted, human-readable summary string.
     """
     header = "embcache savings report"
+    if scope:
+        header += f"  [{scope}]"
     if model:
         header += f"  (model: {model})"
 

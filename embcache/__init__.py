@@ -8,7 +8,8 @@ saved with ``cache.report()``.
 from __future__ import annotations
 
 from .cache import EmbeddingCache
+from .info import CacheInfo
 from .stats import Stats
 
-__all__ = ["EmbeddingCache", "Stats"]
-__version__ = "0.1.0"
+__all__ = ["EmbeddingCache", "Stats", "CacheInfo"]
+__version__ = "0.2.0"

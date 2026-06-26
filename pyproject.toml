@@ -22,13 +22,16 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+embcache = "embcache.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/roshangurumurthy/embcache"
 Repository = "https://github.com/roshangurumurthy/embcache"
 
 [project.optional-dependencies]
 redis = ["redis>=4.0"]
-dev = ["pytest>=7.0", "mypy>=1.0", "redis>=4.0"]
+dev = ["pytest>=7.0", "mypy>=1.0", "redis>=4.0", "fakeredis>=2.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["embcache"]

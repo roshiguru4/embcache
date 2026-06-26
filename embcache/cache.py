@@ -10,12 +10,14 @@ supplies the embed function.
 from __future__ import annotations
 
 import functools
+import json
 import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from . import pricing
 from .backends import Backend, SQLiteBackend
+from .info import CacheInfo
 from .keys import make_key
 from .normalize import normalize
 from .report import format_report
@@ -25,6 +27,13 @@ from .stats import Stats
 Vector = list[float]
 EmbedFn = Callable[[str], Sequence[float]]
 BatchEmbedFn = Callable[[list[str]], Sequence[Sequence[float]]]
+
+
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string, seconds precision."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 class EmbeddingCache:
@@ -59,6 +68,9 @@ class EmbeddingCache:
         self.model = model
         self.lowercase = lowercase
         self.stats = Stats()
+        # Snapshot of session counters already persisted to the backend, so
+        # flush() only ever writes the *delta* (and can be called repeatedly).
+        self._flushed: dict[str, float] = self.stats.snapshot()
         self.backend = self._make_backend(backend, path=path, redis_url=redis_url)
 
     @staticmethod
@@ -176,12 +188,103 @@ class EmbeddingCache:
 
     # -- reporting ----------------------------------------------------------
 
-    def report(self) -> str:
-        """Return a formatted savings report for the session."""
-        return format_report(self.stats, model=self.model)
+    def report(self, scope: str = "session") -> str:
+        """Return a formatted savings report.
+
+        Args:
+            scope: ``"session"`` (default) reports only this process's savings.
+                ``"lifetime"`` flushes and reports the cumulative savings stored
+                in the cache across every run. ``"both"`` shows session then
+                lifetime, separated by a blank line.
+
+        Returns:
+            A formatted, human-readable summary string.
+
+        Raises:
+            ValueError: If ``scope`` is not one of the three accepted values.
+        """
+        if scope == "session":
+            return format_report(self.stats, model=self.model)
+        if scope == "lifetime":
+            return self._lifetime_report()
+        if scope == "both":
+            session = format_report(self.stats, model=self.model, scope="session")
+            return f"{session}\n\n{self._lifetime_report()}"
+        raise ValueError(
+            f"unknown scope {scope!r}; expected 'session', 'lifetime', or 'both'"
+        )
+
+    def _lifetime_report(self) -> str:
+        self.flush()
+        lifetime = Stats.from_counters(self.backend.read_stats())
+        return format_report(lifetime, model=self.model, scope="lifetime")
+
+    def lifetime_stats(self) -> Stats:
+        """Return the cumulative savings stored in the cache (flushes first)."""
+        self.flush()
+        return Stats.from_counters(self.backend.read_stats())
+
+    def info(self) -> CacheInfo:
+        """Return a structured snapshot of the cache's contents and savings.
+
+        Flushes pending session stats first so the figures are current.
+        """
+        self.flush()
+        return CacheInfo(
+            backend=type(self.backend).__name__,
+            model=self.model,
+            entries=self.backend.count(),
+            size_bytes=self.backend.size_bytes(),
+            lifetime=Stats.from_counters(self.backend.read_stats()),
+            models=self._models_seen(),
+            created_at=self.backend.get_meta("created_at"),
+            last_write_at=self.backend.get_meta("last_write_at"),
+        )
+
+    def __len__(self) -> int:
+        """Number of cached vectors. Raises if the backend can't count."""
+        n = self.backend.count()
+        if n is None:
+            raise TypeError(
+                f"{type(self.backend).__name__} does not support len()"
+            )
+        return n
+
+    # -- persistence --------------------------------------------------------
+
+    def flush(self) -> None:
+        """Persist session savings into the cache so they survive the process.
+
+        Writes only the delta since the last flush, using the backend's atomic
+        increment, so calling it repeatedly — or from several processes sharing
+        one cache — accumulates correctly instead of double-counting. A no-op
+        when nothing new has happened.
+        """
+        current = self.stats.snapshot()
+        delta = {k: current[k] - self._flushed.get(k, 0.0) for k in current}
+        if not any(delta.values()):
+            return
+        self.backend.increment_stats(delta)
+        self._stamp_meta()
+        self._flushed = current
+
+    def clear(self, *, reset_stats: bool = False) -> int:
+        """Delete all cached vectors and return how many were removed.
+
+        Lifetime savings are preserved by default — a cleared cache has still
+        "saved" what it saved. Pass ``reset_stats=True`` to also zero the
+        cumulative counters and this session's stats.
+        """
+        removed = self.backend.clear()
+        if reset_stats:
+            self.backend.reset_stats()
+            self.stats.reset()
+            self._flushed = self.stats.snapshot()
+        return removed
 
     def close(self) -> None:
-        """Close the underlying backend."""
+        """Flush pending savings, then close the underlying backend."""
+        self.flush()
         self.backend.close()
 
     def __enter__(self) -> EmbeddingCache:
@@ -194,6 +297,27 @@ class EmbeddingCache:
 
     def _key(self, text: str) -> str:
         return make_key(text, self.model, lowercase=self.lowercase)
+
+    def _models_seen(self) -> list[str]:
+        raw = self.backend.get_meta("models")
+        if not raw:
+            return []
+        try:
+            models = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return models if isinstance(models, list) else []
+
+    def _stamp_meta(self) -> None:
+        """Record timestamps and the contributing model on a flush."""
+        now = _utc_now_iso()
+        if self.backend.get_meta("created_at") is None:
+            self.backend.set_meta("created_at", now)
+        self.backend.set_meta("last_write_at", now)
+        models = self._models_seen()
+        if self.model and self.model not in models:
+            models.append(self.model)
+            self.backend.set_meta("models", json.dumps(models))
 
     def _tokens(self, text: str) -> int:
         return pricing.estimate_tokens(normalize(text, lowercase=self.lowercase))
