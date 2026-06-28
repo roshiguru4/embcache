@@ -4,6 +4,28 @@ All notable changes to embcache are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0]
+
+Broaden integration: async, exact token counts, and an in-memory backend.
+
+### Added
+- **Async API.** `aget_or_compute`, `aget_or_compute_many`, and the `awrap`
+  decorator for async embed functions, plus `async with` support. The cache
+  lookup/store stay synchronous; only your embed call is awaited (and not at all
+  on a hit). Sync and async share one cache.
+- **Pluggable tokenizer.** `EmbeddingCache(tokenizer=...)` accepts `"heuristic"`
+  (default, unchanged), `"tiktoken"` (exact counts, `pip install
+  embcache[tiktoken]`), or any `Callable[[str], int]`. Token counts now reflect
+  the original text — what a hit actually saved you from paying for.
+- **In-memory backend.** `backend="memory"` — a dict-backed, ephemeral store for
+  tests and notebooks, and the reference implementation of the `Backend`
+  contract.
+
+### Changed
+- Batch logic refactored into shared `_collect_misses` / `_store_batch` helpers
+  so the sync and async paths stay in lockstep.
+- Bumped to 0.3.0 (also corrects `pyproject.toml`, which still read 0.1.0).
+
 ## [0.2.0]
 
 Persistent savings + a CLI. Savings now survive the process and you can inspect

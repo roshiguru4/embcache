@@ -69,8 +69,9 @@ The dollar figures are small per run for the cheap models — but multiply by ev
 ## Install
 
 ```bash
-pip install embcache            # SQLite backend, zero config
+pip install embcache            # SQLite + memory backends, zero config
 pip install embcache[redis]     # add the Redis backend
+pip install embcache[tiktoken]  # exact token counts in the savings report
 ```
 
 ## How it works
@@ -106,14 +107,49 @@ def embed(text: str) -> list[float]:
 vecs = cache.get_or_compute_many(["text a", "text b"], embed_fn=my_batch_embed)
 ```
 
+### Async
+
+Embedding APIs are I/O-bound, so async is first-class. The cache lookup/store stay synchronous (they're fast); only your embed call — the network hop — is awaited, and on a hit it isn't awaited at all.
+
+```python
+@cache.awrap
+async def embed(text: str) -> list[float]:
+    resp = await aclient.embeddings.create(input=text, model="text-embedding-3-small")
+    return resp.data[0].embedding
+
+await embed("the cat sat")          # miss: awaits the API, stores the vector
+await embed("the cat sat")          # hit: instant, free, nothing awaited
+
+# or directly:
+vec  = await cache.aget_or_compute("the cat sat", embed_fn=async_embed)
+vecs = await cache.aget_or_compute_many(texts, embed_fn=async_batch_embed)
+
+async with EmbeddingCache(path="./emb.db") as cache:
+    ...                              # flushes savings on exit
+```
+
+Sync and async share one cache: a vector written by `get_or_compute` is an `aget_or_compute` hit, and vice versa.
+
+### Token counting
+
+The token and dollar figures default to a zero-dependency heuristic (~4 chars/token). For exact counts that match what the provider bills, opt into `tiktoken`:
+
+```python
+pip install embcache[tiktoken]
+
+EmbeddingCache(model="text-embedding-3-small", tokenizer="tiktoken")   # exact
+EmbeddingCache(tokenizer=lambda text: my_count(text))                  # or your own
+```
+
 ### Backends
 
 ```python
 EmbeddingCache(backend="sqlite", path="./emb.db")                       # default, local file
+EmbeddingCache(backend="memory")                                        # ephemeral, in-process
 EmbeddingCache(backend="redis", redis_url="redis://localhost:6379/0")   # shared / multi-process
 ```
 
-Both implement the same three-method `Backend` contract (`get` / `set` / `has`) and pass the same test suite, so they're interchangeable. (Persistence and introspection layer on top via default methods, so a custom three-method backend still works.)
+All three implement the same three-method `Backend` contract (`get` / `set` / `has`) and pass the same test suite, so they're interchangeable. (Persistence and introspection layer on top via default methods, so a custom three-method backend still works.) The `memory` backend keeps nothing on disk — handy for tests and notebooks.
 
 ### Introspection
 
@@ -153,7 +189,7 @@ On by default: leading/trailing whitespace is stripped and internal whitespace r
 
 ## What embcache is — and isn't
 
-**Is:** exact-match caching (same text → same vector), model-aware keys, SQLite + Redis backends, cost/savings tracking that persists across runs, a CLI to inspect a cache, full type hints (`py.typed`).
+**Is:** exact-match caching (same text → same vector), model-aware keys, SQLite + memory + Redis backends, sync **and** async APIs, optional exact token counting (tiktoken), cost/savings tracking that persists across runs, a CLI to inspect a cache, full type hints (`py.typed`).
 
 **Isn't:**
 - **No semantic matching.** "Similar" text never reuses a vector — that can return wrong results. Hard line.
@@ -164,7 +200,7 @@ On by default: leading/trailing whitespace is stripped and internal whitespace r
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 74 tests, SQLite + Redis (via fakeredis)
+pytest          # 101 tests, SQLite + memory + Redis (via fakeredis)
 mypy embcache   # clean, strict
 ```
 

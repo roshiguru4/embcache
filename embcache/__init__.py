@@ -12,4 +12,4 @@ from .info import CacheInfo
 from .stats import Stats
 
 __all__ = ["EmbeddingCache", "Stats", "CacheInfo"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

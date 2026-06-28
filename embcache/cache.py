@@ -12,21 +12,23 @@ from __future__ import annotations
 import functools
 import json
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from . import pricing
 from .backends import Backend, SQLiteBackend
 from .info import CacheInfo
 from .keys import make_key
-from .normalize import normalize
 from .report import format_report
 from .serialize import dumps, loads
 from .stats import Stats
+from .tokenizers import Tokenizer, resolve_tokenizer
 
 Vector = list[float]
 EmbedFn = Callable[[str], Sequence[float]]
 BatchEmbedFn = Callable[[list[str]], Sequence[Sequence[float]]]
+AsyncEmbedFn = Callable[[str], Awaitable[Sequence[float]]]
+AsyncBatchEmbedFn = Callable[[list[str]], Awaitable[Sequence[Sequence[float]]]]
 
 
 def _utc_now_iso() -> str:
@@ -53,21 +55,27 @@ class EmbeddingCache:
         path: str = "./emb.db",
         redis_url: str = "redis://localhost:6379/0",
         lowercase: bool = False,
+        tokenizer: str | Tokenizer = "heuristic",
     ) -> None:
         """Create a cache.
 
         Args:
-            backend: ``"sqlite"`` (default), ``"redis"``, or a ready-made
-                :class:`Backend` instance.
+            backend: ``"sqlite"`` (default), ``"memory"``, ``"redis"``, or a
+                ready-made :class:`Backend` instance.
             model: Embedding model name. Folded into cache keys and used for
                 pricing in the savings report.
             path: SQLite database path (used when ``backend="sqlite"``).
             redis_url: Redis URL (used when ``backend="redis"``).
             lowercase: If true, lowercase text during normalization.
+            tokenizer: How to count tokens for the savings report —
+                ``"heuristic"`` (default, ~4 chars/token, no dependency),
+                ``"tiktoken"`` (exact, requires ``embcache[tiktoken]``), or any
+                callable mapping a string to a token count.
         """
         self.model = model
         self.lowercase = lowercase
         self.stats = Stats()
+        self._count_tokens: Tokenizer = resolve_tokenizer(tokenizer, model)
         # Snapshot of session counters already persisted to the backend, so
         # flush() only ever writes the *delta* (and can be called repeatedly).
         self._flushed: dict[str, float] = self.stats.snapshot()
@@ -81,12 +89,17 @@ class EmbeddingCache:
             return backend
         if backend == "sqlite":
             return SQLiteBackend(path=path)
+        if backend == "memory":
+            from .backends import MemoryBackend
+
+            return MemoryBackend()
         if backend == "redis":
             from .backends.redis_backend import RedisBackend
 
             return RedisBackend(redis_url)
         raise ValueError(
-            f"unknown backend {backend!r}; expected 'sqlite', 'redis', or a Backend instance"
+            f"unknown backend {backend!r}; expected 'sqlite', 'memory', 'redis', "
+            "or a Backend instance"
         )
 
     # -- core ---------------------------------------------------------------
@@ -131,45 +144,61 @@ class EmbeddingCache:
         Returns:
             One vector per input text, in order.
         """
-        results: list[Vector | None] = [None] * len(texts)
-        keys = [self._key(t) for t in texts]
+        results, miss_texts, miss_indices = self._collect_misses(texts)
+        if not miss_texts:
+            return [v for v in results if v is not None]
 
-        # Map each unique missing key -> the first text/indices needing it.
-        miss_texts: dict[str, str] = {}
-        miss_indices: dict[str, list[int]] = {}
+        unique_texts = [miss_texts[k] for k in miss_texts]
+        start = time.perf_counter()
+        vectors = embed_fn(unique_texts)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return self._store_batch(results, miss_texts, miss_indices, vectors, elapsed_ms)
 
-        for i, (text, key) in enumerate(zip(texts, keys)):
-            blob = self.backend.get(key)
-            if blob is not None:
-                results[i] = loads(blob)
-                self._record_hit(text)
-            else:
-                if key not in miss_texts:
-                    miss_texts[key] = text
-                    miss_indices[key] = []
-                miss_indices[key].append(i)
+    # -- async --------------------------------------------------------------
 
-        if miss_texts:
-            unique_keys = list(miss_texts)
-            unique_texts = [miss_texts[k] for k in unique_keys]
-            start = time.perf_counter()
-            vectors = embed_fn(unique_texts)
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            self._validate_batch(unique_texts, vectors)
+    async def aget_or_compute(self, text: str, embed_fn: AsyncEmbedFn) -> Vector:
+        """Async variant of :meth:`get_or_compute`.
 
-            # Attribute latency evenly across the unique misses computed.
-            per_miss_ms = elapsed_ms / len(unique_keys)
-            for key, vec in zip(unique_keys, vectors):
-                vector = list(vec)
-                self.backend.set(key, dumps(vector))
-                self.stats.record_miss(latency_ms=per_miss_ms)
-                for idx in miss_indices[key]:
-                    results[idx] = vector
+        The cache lookup and store are synchronous (backend reads/writes are
+        fast); only your ``embed_fn`` — the part that hits the network — is
+        awaited. On a hit ``embed_fn`` is never awaited.
 
-        # All slots are filled by construction.
-        return [v for v in results if v is not None]
+        Args:
+            text: The text to embed.
+            embed_fn: Async callable mapping a single string to a vector.
+        """
+        key = self._key(text)
+        blob = self.backend.get(key)
+        if blob is not None:
+            self._record_hit(text)
+            return loads(blob)
 
-    # -- decorator ----------------------------------------------------------
+        start = time.perf_counter()
+        vector = list(await embed_fn(text))
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        self.backend.set(key, dumps(vector))
+        self.stats.record_miss(latency_ms=elapsed_ms)
+        return vector
+
+    async def aget_or_compute_many(
+        self, texts: Sequence[str], embed_fn: AsyncBatchEmbedFn
+    ) -> list[Vector]:
+        """Async variant of :meth:`get_or_compute_many`.
+
+        Same de-dup / misses-only / order-preserving guarantees; only the batch
+        ``embed_fn`` call is awaited.
+        """
+        results, miss_texts, miss_indices = self._collect_misses(texts)
+        if not miss_texts:
+            return [v for v in results if v is not None]
+
+        unique_texts = [miss_texts[k] for k in miss_texts]
+        start = time.perf_counter()
+        vectors = await embed_fn(unique_texts)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return self._store_batch(results, miss_texts, miss_indices, vectors, elapsed_ms)
+
+    # -- decorators ---------------------------------------------------------
 
     def wrap(self, fn: EmbedFn) -> EmbedFn:
         """Decorator that turns a single-text embed function into a cached one.
@@ -183,6 +212,16 @@ class EmbeddingCache:
         @functools.wraps(fn)
         def wrapper(text: str) -> Vector:
             return self.get_or_compute(text, fn)
+
+        return wrapper
+
+    def awrap(self, fn: AsyncEmbedFn) -> AsyncEmbedFn:
+        """Decorator that turns an async single-text embed function into a
+        cached one. The async counterpart of :meth:`wrap`."""
+
+        @functools.wraps(fn)
+        async def wrapper(text: str) -> Vector:
+            return await self.aget_or_compute(text, fn)
 
         return wrapper
 
@@ -293,7 +332,66 @@ class EmbeddingCache:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
+    async def __aenter__(self) -> EmbeddingCache:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.close()
+
     # -- internals ----------------------------------------------------------
+
+    def _collect_misses(
+        self, texts: Sequence[str]
+    ) -> tuple[list[Vector | None], dict[str, str], dict[str, list[int]]]:
+        """Look up every text; serve hits, and group misses by unique key.
+
+        Returns the partially-filled results list (hits in place, misses still
+        ``None``), a ``key -> representative text`` map of the unique misses,
+        and a ``key -> [original indices]`` map so computed vectors can be
+        scattered back into the right slots. Shared by the sync and async batch
+        paths so the only thing that differs between them is the embed call.
+        """
+        results: list[Vector | None] = [None] * len(texts)
+        miss_texts: dict[str, str] = {}
+        miss_indices: dict[str, list[int]] = {}
+
+        for i, text in enumerate(texts):
+            key = self._key(text)
+            blob = self.backend.get(key)
+            if blob is not None:
+                results[i] = loads(blob)
+                self._record_hit(text)
+            else:
+                if key not in miss_texts:
+                    miss_texts[key] = text
+                    miss_indices[key] = []
+                miss_indices[key].append(i)
+
+        return results, miss_texts, miss_indices
+
+    def _store_batch(
+        self,
+        results: list[Vector | None],
+        miss_texts: dict[str, str],
+        miss_indices: dict[str, list[int]],
+        vectors: Sequence[Sequence[float]],
+        elapsed_ms: float,
+    ) -> list[Vector]:
+        """Store freshly-computed miss vectors and assemble the ordered result."""
+        unique_keys = list(miss_texts)
+        self._validate_batch([miss_texts[k] for k in unique_keys], vectors)
+
+        # Attribute the batch's latency evenly across the unique misses.
+        per_miss_ms = elapsed_ms / len(unique_keys)
+        for key, vec in zip(unique_keys, vectors):
+            vector = list(vec)
+            self.backend.set(key, dumps(vector))
+            self.stats.record_miss(latency_ms=per_miss_ms)
+            for idx in miss_indices[key]:
+                results[idx] = vector
+
+        # All slots are filled by construction.
+        return [v for v in results if v is not None]
 
     def _key(self, text: str) -> str:
         return make_key(text, self.model, lowercase=self.lowercase)
@@ -320,7 +418,10 @@ class EmbeddingCache:
             self.backend.set_meta("models", json.dumps(models))
 
     def _tokens(self, text: str) -> int:
-        return pricing.estimate_tokens(normalize(text, lowercase=self.lowercase))
+        # Count the text as the API would see it on a miss (the original
+        # string), not the normalized key form — that's what a hit actually
+        # saved you from paying for.
+        return self._count_tokens(text)
 
     def _record_hit(self, text: str) -> None:
         tokens = self._tokens(text)
