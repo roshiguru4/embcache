@@ -33,10 +33,16 @@ def _make_redis_backend():
         return None
 
 
-@pytest.fixture(params=["sqlite", "redis"])
+@pytest.fixture(params=["sqlite", "memory", "redis"])
 def backend(request):
     if request.param == "sqlite":
         b = SQLiteBackend(path=":memory:")
+        yield b
+        b.close()
+    elif request.param == "memory":
+        from embcache.backends import MemoryBackend
+
+        b = MemoryBackend()
         yield b
         b.close()
     else:

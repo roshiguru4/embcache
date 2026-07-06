@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "embcache"
-version = "0.1.0"
+version = "0.3.0"
 description = "A drop-in caching layer for text embeddings that proves exactly how much it saved."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,7 +31,14 @@ Repository = "https://github.com/roshangurumurthy/embcache"
 
 [project.optional-dependencies]
 redis = ["redis>=4.0"]
-dev = ["pytest>=7.0", "mypy>=1.0", "redis>=4.0", "fakeredis>=2.0"]
+tiktoken = ["tiktoken>=0.5"]
+dev = [
+    "pytest>=7.0",
+    "mypy>=1.0",
+    "redis>=4.0",
+    "fakeredis>=2.0",
+    "tiktoken>=0.5",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["embcache"]

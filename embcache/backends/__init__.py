@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from .base import Backend
+from .memory_backend import MemoryBackend
 from .sqlite_backend import SQLiteBackend
 
-__all__ = ["Backend", "SQLiteBackend", "RedisBackend"]
+__all__ = ["Backend", "SQLiteBackend", "MemoryBackend", "RedisBackend"]
 
 
 def __getattr__(name: str) -> object:
